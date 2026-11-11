@@ -11,8 +11,9 @@ pub fn apply_process_limits() {
     #[cfg(target_os = "linux")]
     {
         // JavaScriptCore tuning knobs (read at WebKitWebProcess startup)
-        std::env::set_var("JSC_gcMaxHeapSize", "268435456"); // 256 MB JSC heap cap
-        std::env::set_var("JSC_forceRAMSize", "536870912"); // 512 MB total RAM hint
+        // High enough ceiling (1 GB) for heavy SPAs like Elementor Pro while keeping GC active.
+        std::env::set_var("JSC_gcMaxHeapSize", "1073741824"); // 1 GB JSC heap ceiling
+        std::env::set_var("JSC_forceRAMSize", "2147483648"); // 2 GB total RAM hint
         std::env::set_var("JSC_useGC", "1");
         std::env::set_var("JSC_gcMarkingConstraintSolverTimeout", "5.0");
         std::env::set_var("WEBKIT_FORCE_SANDBOX", "0");
@@ -23,9 +24,10 @@ pub fn apply_process_limits() {
 
     #[cfg(target_os = "windows")]
     {
-        // Enforce strict renderer pool & heap limits on Edge WebView2 while enabling smooth scrolling/raster
+        // Balance low-overhead renderer pooling with headroom (1.28 GB V8 heap ceiling) so heavy editors
+        // like Elementor Pro do not hit fatal Out-Of-Memory crashes, plus 200 MB disk cache for faster reloads.
         let existing = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").unwrap_or_default();
-        let flags = "--renderer-process-limit=2 --disk-cache-size=104857600 --js-flags=--max-old-space-size=256 --enable-smooth-scrolling --enable-gpu-rasterization";
+        let flags = "--renderer-process-limit=4 --disk-cache-size=209715200 --js-flags=--max-old-space-size=1280 --enable-smooth-scrolling --enable-gpu-rasterization";
         let combined = if existing.is_empty() {
             flags.to_string()
         } else {

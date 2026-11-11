@@ -30,6 +30,8 @@ use wry::{NewWindowResponse, PageLoadEvent, Rect, WebView, WebViewBuilder};
 const CHROME_HEIGHT: u32 = 86;
 const DEVTOOLS_HEIGHT: u32 = 300;
 const NEWTAB_URL: &str = "ferrox://start";
+const HISTORY_URL: &str = "ferrox://history";
+const BOOKMARKS_URL: &str = "ferrox://bookmarks";
 
 #[derive(Debug)]
 pub enum AppEvent {
@@ -52,6 +54,8 @@ enum ChromeCmd {
     Navigate { input: String },
     QuerySuggest { query: String },
     SuggestRows { count: usize },
+    SetFindOpen { open: bool },
+    ClearHistory,
     Back,
     Forward,
     ReloadOrStop,
@@ -115,7 +119,9 @@ struct UiSyncCache {
     cached_rss_mb: f64,
     loading_tabs: HashSet<Uuid>,
     tab_zoom: HashMap<Uuid, f64>,
+    closed_tabs: Vec<String>,
     suggest_rows: usize,
+    find_open: bool,
     toast: Option<(String, Instant)>,
 }
 
@@ -126,7 +132,9 @@ impl Default for UiSyncCache {
             cached_rss_mb: 0.0,
             loading_tabs: HashSet::new(),
             tab_zoom: HashMap::new(),
+            closed_tabs: Vec::new(),
             suggest_rows: 0,
+            find_open: false,
             toast: None,
         }
     }
@@ -150,8 +158,7 @@ pub fn run_windows_browser(config: FeroxConfig) -> Result<()> {
 
     let mut devtools_open = false;
     let mut ui_cache = UiSyncCache::default();
-    let (chrome_rect, content_rect, dt_rect) =
-        compute_rects(&window, devtools_open, ui_cache.suggest_rows);
+    let (chrome_rect, content_rect, dt_rect) = compute_rects(&window, devtools_open, &ui_cache);
 
     let chrome_proxy = proxy.clone();
     let chrome_wv = WebViewBuilder::new()
@@ -223,7 +230,7 @@ pub fn run_windows_browser(config: FeroxConfig) -> Result<()> {
                 event: WindowEvent::Resized(_),
                 ..
             } => {
-                relayout_views(&window, &chrome_wv, &devtools_wv, &tab_manager, devtools_open, ui_cache.suggest_rows);
+                relayout_views(&window, &chrome_wv, &devtools_wv, &tab_manager, devtools_open, &ui_cache);
             }
             Event::WindowEvent {
                 event: WindowEvent::ModifiersChanged(mods),
@@ -254,14 +261,24 @@ pub fn run_windows_browser(config: FeroxConfig) -> Result<()> {
                     Some("focus_url")
                 } else if ctrl_held && physical_key == KeyCode::KeyF {
                     Some("find")
+                } else if ctrl_held && shift_held && physical_key == KeyCode::KeyT {
+                    Some("reopen_tab")
                 } else if ctrl_held && physical_key == KeyCode::KeyT {
                     Some("new_tab")
                 } else if ctrl_held && physical_key == KeyCode::KeyW {
                     Some("close_tab")
+                } else if ctrl_held && physical_key == KeyCode::Tab {
+                    Some(if shift_held { "prev_tab" } else { "next_tab" })
+                } else if ctrl_held && physical_key == KeyCode::KeyH {
+                    Some("history")
+                } else if ctrl_held && shift_held && physical_key == KeyCode::KeyB {
+                    Some("bookmarks")
                 } else if ctrl_held && physical_key == KeyCode::KeyD {
                     Some("bookmark")
                 } else if physical_key == KeyCode::F5 || (ctrl_held && physical_key == KeyCode::KeyR) {
                     Some("reload")
+                } else if physical_key == KeyCode::Escape {
+                    Some("escape")
                 } else if alt_held && physical_key == KeyCode::ArrowLeft {
                     Some("back")
                 } else if alt_held && physical_key == KeyCode::ArrowRight {
@@ -299,20 +316,17 @@ pub fn run_windows_browser(config: FeroxConfig) -> Result<()> {
                             }
                             ChromeCmd::Navigate { input } => {
                                 ui_cache.suggest_rows = 0;
-                                relayout_views(&window, &chrome_wv, &devtools_wv, &tab_manager, devtools_open, 0);
+                                relayout_views(&window, &chrome_wv, &devtools_wv, &tab_manager, devtools_open, &ui_cache);
                                 let url = normalize_input(&input, &config);
                                 if let Some(id) = tab_manager.active_tab_id() {
-                                    if url == NEWTAB_URL {
-                                        tab_manager.update_tab_metadata(id, Some(NEWTAB_URL), Some("New Tab"));
-                                        if let Some(wv) = tab_manager.get_tab(id).and_then(|t| t.webview.as_ref()) {
-                                            let _ = wv.load_html(&build_start_page_html(&storage, &tab_manager, &mut ui_cache));
-                                        }
-                                        sync_chrome_ui(&chrome_wv, &tab_manager, &storage, &mut ui_cache);
-                                    } else if let Some(wv) = tab_manager.get_tab(id).and_then(|t| t.webview.as_ref()) {
-                                        ui_cache.loading_tabs.insert(id);
-                                        sync_chrome_ui(&chrome_wv, &tab_manager, &storage, &mut ui_cache);
-                                        let _ = wv.load_url(&url);
-                                    }
+                                    navigate_existing_tab(
+                                        id,
+                                        &url,
+                                        &chrome_wv,
+                                        &mut tab_manager,
+                                        &storage,
+                                        &mut ui_cache,
+                                    );
                                 }
                             }
                             ChromeCmd::QuerySuggest { query } => {
@@ -320,7 +334,7 @@ pub fn run_windows_browser(config: FeroxConfig) -> Result<()> {
                                 let next_rows = suggestions.len();
                                 if ui_cache.suggest_rows != next_rows {
                                     ui_cache.suggest_rows = next_rows;
-                                    relayout_views(&window, &chrome_wv, &devtools_wv, &tab_manager, devtools_open, next_rows);
+                                    relayout_views(&window, &chrome_wv, &devtools_wv, &tab_manager, devtools_open, &ui_cache);
                                 }
                                 if let Ok(json) = serde_json::to_string(&suggestions) {
                                     let _ = chrome_wv.evaluate_script(&format!(
@@ -331,8 +345,40 @@ pub fn run_windows_browser(config: FeroxConfig) -> Result<()> {
                             ChromeCmd::SuggestRows { count } => {
                                 if ui_cache.suggest_rows != count {
                                     ui_cache.suggest_rows = count;
-                                    relayout_views(&window, &chrome_wv, &devtools_wv, &tab_manager, devtools_open, count);
+                                    relayout_views(&window, &chrome_wv, &devtools_wv, &tab_manager, devtools_open, &ui_cache);
                                 }
+                            }
+                            ChromeCmd::SetFindOpen { open } => {
+                                if ui_cache.find_open != open {
+                                    ui_cache.find_open = open;
+                                    relayout_views(&window, &chrome_wv, &devtools_wv, &tab_manager, devtools_open, &ui_cache);
+                                }
+                            }
+                            ChromeCmd::ClearHistory => {
+                                storage.clear_history();
+                                ui_cache.toast = Some(("History cleared".to_string(), Instant::now()));
+                                if let Some(id) = tab_manager.active_tab_id() {
+                                    let is_hist = tab_manager
+                                        .get_tab(id)
+                                        .map(|t| t.url == HISTORY_URL || t.url == NEWTAB_URL)
+                                        .unwrap_or(false);
+                                    if is_hist {
+                                        let cur_url = tab_manager
+                                            .get_tab(id)
+                                            .map(|t| t.url.clone())
+                                            .unwrap_or_else(|| NEWTAB_URL.to_string());
+                                        navigate_existing_tab(
+                                            id,
+                                            &cur_url,
+                                            &chrome_wv,
+                                            &mut tab_manager,
+                                            &storage,
+                                            &mut ui_cache,
+                                        );
+                                        return;
+                                    }
+                                }
+                                sync_chrome_ui(&chrome_wv, &tab_manager, &storage, &mut ui_cache);
                             }
                             ChromeCmd::Back => {
                                 if let Some(wv) = active_webview(&tab_manager) {
@@ -362,12 +408,14 @@ pub fn run_windows_browser(config: FeroxConfig) -> Result<()> {
                             }
                             ChromeCmd::Home => {
                                 if let Some(id) = tab_manager.active_tab_id() {
-                                    ui_cache.loading_tabs.remove(&id);
-                                    tab_manager.update_tab_metadata(id, Some(NEWTAB_URL), Some("New Tab"));
-                                    if let Some(wv) = tab_manager.get_tab(id).and_then(|t| t.webview.as_ref()) {
-                                        let _ = wv.load_html(&build_start_page_html(&storage, &tab_manager, &mut ui_cache));
-                                    }
-                                    sync_chrome_ui(&chrome_wv, &tab_manager, &storage, &mut ui_cache);
+                                    navigate_existing_tab(
+                                        id,
+                                        NEWTAB_URL,
+                                        &chrome_wv,
+                                        &mut tab_manager,
+                                        &storage,
+                                        &mut ui_cache,
+                                    );
                                 }
                             }
                             ChromeCmd::NewTab => {
@@ -386,8 +434,7 @@ pub fn run_windows_browser(config: FeroxConfig) -> Result<()> {
                             }
                             ChromeCmd::SwitchTab { id } => {
                                 if let Ok(target_id) = Uuid::parse_str(&id) {
-                                    let (_, content_r, _) =
-                                        compute_rects(&window, devtools_open, ui_cache.suggest_rows);
+                                    let (_, content_r, _) = compute_rects(&window, devtools_open, &ui_cache);
                                     let is_suspended = tab_manager
                                         .get_tab(target_id)
                                         .map(|t| t.state == TabState::Suspended)
@@ -397,11 +444,12 @@ pub fn run_windows_browser(config: FeroxConfig) -> Result<()> {
                                             .get_tab(target_id)
                                             .map(|t| t.url.clone())
                                             .unwrap_or_else(|| NEWTAB_URL.to_string());
-                                        let html = if restore_url == NEWTAB_URL {
-                                            Some(build_start_page_html(&storage, &tab_manager, &mut ui_cache))
-                                        } else {
-                                            None
-                                        };
+                                        let html = build_internal_page(
+                                            &restore_url,
+                                            &storage,
+                                            &tab_manager,
+                                            &mut ui_cache,
+                                        );
                                         if let Ok((new_wv, _)) = build_tab_webview(
                                             &window,
                                             target_id,
@@ -415,7 +463,7 @@ pub fn run_windows_browser(config: FeroxConfig) -> Result<()> {
                                         }
                                     }
                                     tab_manager.focus_tab(target_id);
-                                    focus_current_active(&window, &tab_manager, devtools_open, ui_cache.suggest_rows);
+                                    focus_current_active(&window, &tab_manager, devtools_open, &ui_cache);
                                     if let Some(&z) = ui_cache.tab_zoom.get(&target_id) {
                                         if let Some(wv) = active_webview(&tab_manager) {
                                             let _ = wv.zoom(z);
@@ -427,10 +475,15 @@ pub fn run_windows_browser(config: FeroxConfig) -> Result<()> {
                             ChromeCmd::CloseTab { id } => {
                                 if tab_manager.total_tab_count() > 1 {
                                     if let Ok(target_id) = Uuid::parse_str(&id) {
+                                        if let Some(tab) = tab_manager.get_tab(target_id) {
+                                            if !tab.url.is_empty() && ui_cache.closed_tabs.len() < 20 {
+                                                ui_cache.closed_tabs.push(tab.url.clone());
+                                            }
+                                        }
                                         ui_cache.loading_tabs.remove(&target_id);
                                         ui_cache.tab_zoom.remove(&target_id);
                                         tab_manager.close_tab(target_id);
-                                        focus_current_active(&window, &tab_manager, devtools_open, ui_cache.suggest_rows);
+                                        focus_current_active(&window, &tab_manager, devtools_open, &ui_cache);
                                         sync_chrome_ui(&chrome_wv, &tab_manager, &storage, &mut ui_cache);
                                     }
                                 }
@@ -560,13 +613,21 @@ pub fn run_windows_browser(config: FeroxConfig) -> Result<()> {
                     }
                 }
                 AppEvent::RedirectUrl { tab_id, url } => {
-                    if let Some(wv) = tab_manager.get_tab(tab_id).and_then(|t| t.webview.as_ref()) {
+                    if url.starts_with("ferrox://") {
+                        navigate_existing_tab(
+                            tab_id,
+                            &url,
+                            &chrome_wv,
+                            &mut tab_manager,
+                            &storage,
+                            &mut ui_cache,
+                        );
+                    } else if let Some(wv) = tab_manager.get_tab(tab_id).and_then(|t| t.webview.as_ref()) {
                         let _ = wv.load_url(&url);
                     }
                 }
                 AppEvent::OpenInNewTab { url } => {
-                    let (_, content_r, _) =
-                        compute_rects(&window, devtools_open, ui_cache.suggest_rows);
+                    let (_, content_r, _) = compute_rects(&window, devtools_open, &ui_cache);
                     if open_and_focus_tab(
                         &window,
                         &mut tab_manager,
@@ -728,14 +789,7 @@ fn handle_shortcut(
     match action {
         "devtools" => {
             *devtools_open = !*devtools_open;
-            relayout_views(
-                window,
-                chrome_wv,
-                devtools_wv,
-                tab_manager,
-                *devtools_open,
-                ui_cache.suggest_rows,
-            );
+            relayout_views(window, chrome_wv, devtools_wv, tab_manager, *devtools_open, ui_cache);
             let _ = devtools_wv.set_visible(*devtools_open);
         }
         "focus_url" => {
@@ -748,9 +802,22 @@ fn handle_shortcut(
             let _ = chrome_wv.focus();
             let _ = chrome_wv.evaluate_script("window.toggleFindBar();");
         }
+        "escape" => {
+            if ui_cache.find_open {
+                ui_cache.find_open = false;
+                relayout_views(window, chrome_wv, devtools_wv, tab_manager, *devtools_open, ui_cache);
+                let _ = chrome_wv.evaluate_script("window.closeFindBar();");
+            } else if let Some(id) = tab_manager.active_tab_id() {
+                if ui_cache.loading_tabs.remove(&id) {
+                    if let Some(wv) = active_webview(tab_manager) {
+                        let _ = wv.evaluate_script("window.stop();");
+                    }
+                    sync_chrome_ui(chrome_wv, tab_manager, storage, ui_cache);
+                }
+            }
+        }
         "new_tab" => {
-            let (_, content_r, _) =
-                compute_rects(window, *devtools_open, ui_cache.suggest_rows);
+            let (_, content_r, _) = compute_rects(window, *devtools_open, ui_cache);
             if open_and_focus_tab(
                 window,
                 tab_manager,
@@ -766,15 +833,95 @@ fn handle_shortcut(
                 sync_chrome_ui(chrome_wv, tab_manager, storage, ui_cache);
             }
         }
+        "reopen_tab" => {
+            if let Some(last_url) = ui_cache.closed_tabs.pop() {
+                let (_, content_r, _) = compute_rects(window, *devtools_open, ui_cache);
+                if open_and_focus_tab(
+                    window,
+                    tab_manager,
+                    &last_url,
+                    content_r,
+                    config,
+                    storage,
+                    ui_cache,
+                    proxy,
+                )
+                .is_ok()
+                {
+                    sync_chrome_ui(chrome_wv, tab_manager, storage, ui_cache);
+                }
+            }
+        }
         "close_tab" => {
             if tab_manager.total_tab_count() > 1 {
                 if let Some(id) = tab_manager.active_tab_id() {
+                    if let Some(tab) = tab_manager.get_tab(id) {
+                        if !tab.url.is_empty() && ui_cache.closed_tabs.len() < 20 {
+                            ui_cache.closed_tabs.push(tab.url.clone());
+                        }
+                    }
                     ui_cache.loading_tabs.remove(&id);
                     ui_cache.tab_zoom.remove(&id);
                     tab_manager.close_tab(id);
-                    focus_current_active(window, tab_manager, *devtools_open, ui_cache.suggest_rows);
+                    focus_current_active(window, tab_manager, *devtools_open, ui_cache);
                     sync_chrome_ui(chrome_wv, tab_manager, storage, ui_cache);
                 }
+            }
+        }
+        "next_tab" | "prev_tab" => {
+            let ordered: Vec<Uuid> = tab_manager.ordered_tabs().into_iter().map(|t| t.id).collect();
+            if ordered.len() > 1 {
+                if let Some(cur) = tab_manager.active_tab_id() {
+                    if let Some(idx) = ordered.iter().position(|&id| id == cur) {
+                        let target_idx = if action == "next_tab" {
+                            (idx + 1) % ordered.len()
+                        } else {
+                            (idx + ordered.len() - 1) % ordered.len()
+                        };
+                        let target_id = ordered[target_idx];
+                        let (_, content_r, _) = compute_rects(window, *devtools_open, ui_cache);
+                        let is_suspended = tab_manager
+                            .get_tab(target_id)
+                            .map(|t| t.state == TabState::Suspended)
+                            .unwrap_or(false);
+                        if is_suspended {
+                            let restore_url = tab_manager
+                                .get_tab(target_id)
+                                .map(|t| t.url.clone())
+                                .unwrap_or_else(|| NEWTAB_URL.to_string());
+                            let html = build_internal_page(&restore_url, storage, tab_manager, ui_cache);
+                            if let Ok((new_wv, _)) = build_tab_webview(
+                                window,
+                                target_id,
+                                &restore_url,
+                                html.as_deref(),
+                                content_r,
+                                config,
+                                proxy,
+                            ) {
+                                let _ = tab_manager.restore_tab(target_id, new_wv);
+                            }
+                        }
+                        tab_manager.focus_tab(target_id);
+                        focus_current_active(window, tab_manager, *devtools_open, ui_cache);
+                        if let Some(&z) = ui_cache.tab_zoom.get(&target_id) {
+                            if let Some(wv) = active_webview(tab_manager) {
+                                let _ = wv.zoom(z);
+                            }
+                        }
+                        sync_chrome_ui(chrome_wv, tab_manager, storage, ui_cache);
+                    }
+                }
+            }
+        }
+        "history" => {
+            if let Some(id) = tab_manager.active_tab_id() {
+                navigate_existing_tab(id, HISTORY_URL, chrome_wv, tab_manager, storage, ui_cache);
+            }
+        }
+        "bookmarks" => {
+            if let Some(id) = tab_manager.active_tab_id() {
+                navigate_existing_tab(id, BOOKMARKS_URL, chrome_wv, tab_manager, storage, ui_cache);
             }
         }
         "bookmark" => {
@@ -822,6 +969,33 @@ fn handle_shortcut(
     }
 }
 
+fn navigate_existing_tab(
+    id: Uuid,
+    url: &str,
+    chrome_wv: &WebView,
+    tab_manager: &mut TabManager,
+    storage: &BrowserStorage,
+    ui_cache: &mut UiSyncCache,
+) {
+    if let Some(html) = build_internal_page(url, storage, tab_manager, ui_cache) {
+        let title = match url {
+            HISTORY_URL => "History",
+            BOOKMARKS_URL => "Bookmarks",
+            _ => "New Tab",
+        };
+        ui_cache.loading_tabs.remove(&id);
+        tab_manager.update_tab_metadata(id, Some(url), Some(title));
+        if let Some(wv) = tab_manager.get_tab(id).and_then(|t| t.webview.as_ref()) {
+            let _ = wv.load_html(&html);
+        }
+        sync_chrome_ui(chrome_wv, tab_manager, storage, ui_cache);
+    } else if let Some(wv) = tab_manager.get_tab(id).and_then(|t| t.webview.as_ref()) {
+        ui_cache.loading_tabs.insert(id);
+        sync_chrome_ui(chrome_wv, tab_manager, storage, ui_cache);
+        let _ = wv.load_url(url);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn open_and_focus_tab(
     window: &Window,
@@ -834,11 +1008,7 @@ fn open_and_focus_tab(
     proxy: &EventLoopProxy<AppEvent>,
 ) -> Result<Uuid> {
     let id = Uuid::new_v4();
-    let html = if url == NEWTAB_URL {
-        Some(build_start_page_html(storage, tab_manager, ui_cache))
-    } else {
-        None
-    };
+    let html = build_internal_page(url, storage, tab_manager, ui_cache);
 
     let (wv, _) = build_tab_webview(
         window,
@@ -896,6 +1066,13 @@ fn build_tab_webview(
         .with_devtools(config.devtools.enabled)
         .with_initialization_script(CONTENT_TELEMETRY_JS)
         .with_navigation_handler(move |target_url| {
+            if target_url.starts_with("ferrox://") {
+                let _ = nav_proxy.send_event(AppEvent::RedirectUrl {
+                    tab_id,
+                    url: target_url,
+                });
+                return false;
+            }
             if nav_adblock && adblock::is_blocked(&target_url) {
                 let _ = nav_proxy.send_event(AppEvent::NavigationBlocked {
                     tab_id,
@@ -979,9 +1156,9 @@ fn focus_current_active(
     window: &Window,
     tab_manager: &TabManager,
     devtools_open: bool,
-    suggest_rows: usize,
+    ui_cache: &UiSyncCache,
 ) {
-    let (_, content_r, _) = compute_rects(window, devtools_open, suggest_rows);
+    let (_, content_r, _) = compute_rects(window, devtools_open, ui_cache);
     let active_id = tab_manager.active_tab_id();
     if let Some(wv) = active_webview(tab_manager) {
         let _ = wv.set_bounds(content_r);
@@ -1007,16 +1184,17 @@ fn hide_inactive_tab_views(tab_manager: &TabManager, active_id: Option<Uuid>) {
     }
 }
 
-fn compute_rects(window: &Window, devtools_open: bool, suggest_rows: usize) -> (Rect, Rect, Rect) {
+fn compute_rects(window: &Window, devtools_open: bool, ui_cache: &UiSyncCache) -> (Rect, Rect, Rect) {
     let size = window.inner_size().to_logical::<u32>(window.scale_factor());
     let w = size.width.max(320);
     let h = size.height.max(240);
-    let suggest_extra = if suggest_rows > 0 {
-        (suggest_rows as u32 * 30 + 12).min(170)
+    let suggest_extra = if ui_cache.suggest_rows > 0 {
+        (ui_cache.suggest_rows as u32 * 30 + 12).min(170)
     } else {
         0
     };
-    let chrome_h = CHROME_HEIGHT + suggest_extra;
+    let find_extra = if ui_cache.find_open { 38 } else { 0 };
+    let chrome_h = CHROME_HEIGHT + suggest_extra.max(find_extra);
     let dt_h = if devtools_open && h > chrome_h + 160 {
         DEVTOOLS_HEIGHT.min(h - chrome_h - 120)
     } else {
@@ -1045,9 +1223,9 @@ fn relayout_views(
     devtools_wv: &WebView,
     tab_manager: &TabManager,
     devtools_open: bool,
-    suggest_rows: usize,
+    ui_cache: &UiSyncCache,
 ) {
-    let (cr, content_r, dr) = compute_rects(window, devtools_open, suggest_rows);
+    let (cr, content_r, dr) = compute_rects(window, devtools_open, ui_cache);
     let _ = chrome_wv.set_bounds(cr);
     let _ = devtools_wv.set_bounds(dr);
     for tab in tab_manager.ordered_tabs() {
@@ -1117,6 +1295,27 @@ fn sync_chrome_ui(
     }
 }
 
+fn build_internal_page(
+    url: &str,
+    storage: &BrowserStorage,
+    tab_manager: &TabManager,
+    cache: &mut UiSyncCache,
+) -> Option<String> {
+    match url {
+        NEWTAB_URL => Some(build_start_page_html(storage, tab_manager, cache)),
+        HISTORY_URL => Some(build_history_page_html(storage)),
+        BOOKMARKS_URL => Some(build_bookmarks_page_html(storage)),
+        _ => None,
+    }
+}
+
+fn esc_text(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 fn build_start_page_html(
     storage: &BrowserStorage,
     tab_manager: &TabManager,
@@ -1133,24 +1332,39 @@ fn build_start_page_html(
             .iter()
             .take(8)
             .map(|b| {
-                let t = b.title.replace('<', "&lt;").replace('>', "&gt;");
-                let u = b.url.replace('"', "&quot;");
+                let t = esc_text(&b.title);
+                let u = esc_text(&b.url);
                 format!("<a class='card' href=\"{u}\"><div class='ct'>{t}</div><div class='cu'>{u}</div></a>")
             })
             .collect()
     };
 
+    let recent = storage.recent_history(6);
+    let recent_html: String = if recent.is_empty() {
+        String::new()
+    } else {
+        let cards: String = recent
+            .iter()
+            .map(|h| {
+                let t = esc_text(&h.title);
+                let u = esc_text(&h.url);
+                format!("<a class='card' href=\"{u}\"><div class='ct'>{t}</div><div class='cu'>{u} &bull; {}x</div></a>", h.visit_count)
+            })
+            .collect();
+        format!("<div class='sec' style='margin-top:24px'><h3>Recent History</h3><div class='grid'>{cards}</div></div>")
+    };
+
     format!(
         r#"<!doctype html><html><head><meta charset="utf-8"><title>New Tab</title><style>
 *{{box-sizing:border-box;font-family:system-ui,-apple-system,Segoe UI,sans-serif}}
-body{{margin:0;min-height:100vh;background:radial-gradient(circle at top,#24273a,#181825 65%);color:#cdd6f4;display:flex;flex-direction:column;align-items:center;padding:56px 24px}}
+body{{margin:0;min-height:100vh;background:radial-gradient(circle at top,#24273a,#181825 65%);color:#cdd6f4;display:flex;flex-direction:column;align-items:center;padding:52px 24px}}
 h1{{margin:0 0 6px;font-size:32px;letter-spacing:.5px;color:#89b4fa}}
-.sub{{color:#a6adc8;font-size:13px;margin-bottom:26px}}
-.search{{display:flex;width:100%;max-width:620px;gap:8px;margin-bottom:28px}}
+.sub{{color:#a6adc8;font-size:13px;margin-bottom:24px}}
+.search{{display:flex;width:100%;max-width:620px;gap:8px;margin-bottom:24px}}
 .search input{{flex:1;padding:12px 18px;border-radius:24px;border:1px solid #45475a;background:#1e1e2e;color:#cdd6f4;font-size:15px;outline:none}}
 .search input:focus{{border-color:#89b4fa}}
 .search button{{padding:0 20px;border-radius:24px;border:none;background:#89b4fa;color:#11111b;font-weight:600;cursor:pointer}}
-.pills{{display:flex;flex-wrap:wrap;gap:10px;justify-content:center;margin-bottom:32px}}
+.pills{{display:flex;flex-wrap:wrap;gap:10px;justify-content:center;margin-bottom:28px}}
 .pill{{padding:8px 14px;border-radius:18px;background:#313244;color:#cdd6f4;text-decoration:none;font-size:13px;border:1px solid #45475a}}
 .pill:hover{{background:#45475a;border-color:#89b4fa}}
 .sec{{width:100%;max-width:760px}}
@@ -1163,7 +1377,7 @@ h1{{margin:0 0 6px;font-size:32px;letter-spacing:.5px;color:#89b4fa}}
 .empty{{color:#6c7086;font-size:13px}}
 </style></head><body>
 <h1>Ferrox</h1>
-<div class="sub">Lightweight Engine &bull; UI {rss:.1} MB &bull; {live}/{total} Live Tabs &bull; AdBlock Active</div>
+<div class="sub">Lightweight Engine &bull; {rss:.1} MB Total &bull; {live}/{total} Live Tabs &bull; AdBlock Active</div>
 <form class="search" onsubmit="event.preventDefault();const q=document.getElementById('q').value.trim();if(!q)return;location.href=(q.includes('://')||(q.includes('.')&&!q.includes(' ')))?(q.includes('://')?q:'https://'+q):'https://search.brave.com/search?q='+encodeURIComponent(q);">
   <input id="q" autofocus placeholder="Search the web or enter URL..." />
   <button type="submit">Go</button>
@@ -1173,17 +1387,77 @@ h1{{margin:0 0 6px;font-size:32px;letter-spacing:.5px;color:#89b4fa}}
   <a class="pill" href="https://news.ycombinator.com">Hacker News</a>
   <a class="pill" href="https://www.wikipedia.org">Wikipedia</a>
   <a class="pill" href="https://doc.rust-lang.org">Rust Docs</a>
-  <a class="pill" href="https://developer.mozilla.org">MDN Web Docs</a>
+  <a class="pill" href="ferrox://bookmarks">Bookmarks</a>
+  <a class="pill" href="ferrox://history">History</a>
 </div>
 <div class="sec">
   <h3>Bookmarks</h3>
   <div class="grid">{bookmarks}</div>
 </div>
+{recent_html}
 </body></html>"#,
         rss = cache.cached_rss_mb,
         live = tab_manager.live_tab_count(),
         total = tab_manager.total_tab_count(),
-        bookmarks = bookmarks_html
+        bookmarks = bookmarks_html,
+        recent_html = recent_html
+    )
+}
+
+fn build_history_page_html(storage: &BrowserStorage) -> String {
+    let rows: String = if storage.recent_history(100).is_empty() {
+        "<div class='empty'>No browsing history yet.</div>".to_string()
+    } else {
+        storage
+            .recent_history(100)
+            .into_iter()
+            .map(|h| {
+                let t = esc_text(&h.title);
+                let u = esc_text(&h.url);
+                let when = h.visited_at.format("%Y-%m-%d %H:%M");
+                format!("<a class='row' href=\"{u}\"><span class='t'>{t}</span><span class='u'>{u}</span><span class='m'>{when} ({}x)</span></a>", h.visit_count)
+            })
+            .collect()
+    };
+    format!(
+        r#"<!doctype html><html><head><meta charset="utf-8"><title>History</title><style>
+*{{box-sizing:border-box;font-family:system-ui,-apple-system,Segoe UI,sans-serif}}
+body{{margin:0;min-height:100vh;background:#181825;color:#cdd6f4;padding:32px}}
+h2{{color:#89b4fa;margin-top:0}} .top{{display:flex;justify-content:space-between;align-items:center;max-width:860px;margin:0 auto 16px}}
+.list{{max-width:860px;margin:0 auto;display:flex;flex-direction:column;gap:6px}}
+.row{{display:grid;grid-template-columns:1.2fr 1.6fr auto;gap:12px;padding:10px 14px;background:#1e1e2e;border:1px solid #313244;border-radius:8px;text-decoration:none;color:inherit;align-items:center}}
+.row:hover{{border-color:#89b4fa}} .t{{font-weight:600;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.u{{color:#89b4fa;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}} .m{{color:#6c7086;font-size:11px;white-space:nowrap}}
+.pill{{padding:6px 12px;border-radius:8px;background:#313244;color:#cdd6f4;text-decoration:none;font-size:12px}} .empty{{color:#6c7086}}
+</style></head><body><div class="top"><h2>Browsing History</h2><a class="pill" href="ferrox://start">Back to Start</a></div><div class="list">{rows}</div></body></html>"#
+    )
+}
+
+fn build_bookmarks_page_html(storage: &BrowserStorage) -> String {
+    let rows: String = if storage.bookmarks().is_empty() {
+        "<div class='empty'>No bookmarks saved yet. Press Ctrl+D on any page.</div>".to_string()
+    } else {
+        storage
+            .bookmarks()
+            .iter()
+            .map(|b| {
+                let t = esc_text(&b.title);
+                let u = esc_text(&b.url);
+                format!("<a class='row' href=\"{u}\"><span class='t'>{t}</span><span class='u'>{u}</span></a>")
+            })
+            .collect()
+    };
+    format!(
+        r#"<!doctype html><html><head><meta charset="utf-8"><title>Bookmarks</title><style>
+*{{box-sizing:border-box;font-family:system-ui,-apple-system,Segoe UI,sans-serif}}
+body{{margin:0;min-height:100vh;background:#181825;color:#cdd6f4;padding:32px}}
+h2{{color:#f9e2af;margin-top:0}} .top{{display:flex;justify-content:space-between;align-items:center;max-width:860px;margin:0 auto 16px}}
+.list{{max-width:860px;margin:0 auto;display:flex;flex-direction:column;gap:6px}}
+.row{{display:grid;grid-template-columns:1fr 1.6fr;gap:12px;padding:10px 14px;background:#1e1e2e;border:1px solid #313244;border-radius:8px;text-decoration:none;color:inherit;align-items:center}}
+.row:hover{{border-color:#f9e2af}} .t{{font-weight:600;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.u{{color:#89b4fa;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.pill{{padding:6px 12px;border-radius:8px;background:#313244;color:#cdd6f4;text-decoration:none;font-size:12px}} .empty{{color:#6c7086}}
+</style></head><body><div class="top"><h2>Saved Bookmarks</h2><a class="pill" href="ferrox://start">Back to Start</a></div><div class="list">{rows}</div></body></html>"#
     )
 }
 
@@ -1383,12 +1657,17 @@ const CONTENT_TELEMETRY_JS: &str = r#"(function(){
     const k = e.key.toLowerCase();
     let action = null;
     if(e.key === 'F12' || (e.ctrlKey && e.shiftKey && k === 'i')) action = 'devtools';
+    else if(e.ctrlKey && e.shiftKey && k === 't') action = 'reopen_tab';
     else if(e.ctrlKey && !e.altKey && k === 't') action = 'new_tab';
     else if(e.ctrlKey && !e.altKey && k === 'w') action = 'close_tab';
+    else if(e.ctrlKey && e.key === 'Tab') action = e.shiftKey ? 'prev_tab' : 'next_tab';
+    else if(e.ctrlKey && !e.altKey && k === 'h') action = 'history';
+    else if(e.ctrlKey && e.shiftKey && k === 'b') action = 'bookmarks';
     else if(e.ctrlKey && !e.altKey && k === 'l') action = 'focus_url';
     else if(e.ctrlKey && !e.altKey && k === 'f') action = 'find';
     else if(e.ctrlKey && !e.altKey && k === 'd') action = 'bookmark';
     else if(e.key === 'F5' || (e.ctrlKey && !e.altKey && k === 'r')) action = 'reload';
+    else if(e.key === 'Escape') action = 'escape';
     else if(e.altKey && e.key === 'ArrowLeft') action = 'back';
     else if(e.altKey && e.key === 'ArrowRight') action = 'forward';
     else if(e.ctrlKey && (e.key === '=' || e.key === '+')) action = 'zoom_in';
@@ -1396,10 +1675,18 @@ const CONTENT_TELEMETRY_JS: &str = r#"(function(){
     else if(e.ctrlKey && e.key === '0') action = 'zoom_reset';
     if(action){ e.preventDefault(); sendNow({kind:'shortcut', action}); }
   }, true);
-  const fmt = (args) => Array.from(args).map(a => {
-    if(typeof a === 'object' && a !== null) { try { return JSON.stringify(a); } catch { return String(a); } }
-    return String(a);
-  }).join(' ');
+  // Bounded O(1) argument preview so heavy builders (e.g. Elementor Pro) never stall/OOM on console.log(state)
+  const safeVal = (a) => {
+    if(a === null || typeof a !== 'object') return String(a).slice(0, 240);
+    if(a instanceof Error) return (a.name + ': ' + a.message).slice(0, 240);
+    if(typeof Node !== 'undefined' && a instanceof Node) return '<' + (a.tagName || a.nodeName) + '>';
+    if(Array.isArray(a)) return '[Array(' + a.length + ')]';
+    try {
+      const keys = Object.keys(a).slice(0, 6);
+      return '{' + keys.join(', ') + (Object.keys(a).length > 6 ? ', ...' : '') + '}';
+    } catch { return '[Object]'; }
+  };
+  const fmt = (args) => Array.from(args).slice(0, 8).map(safeVal).join(' ').slice(0, 400);
   ['log','warn','error','info'].forEach(lvl => {
     const orig = console[lvl].bind(console);
     console[lvl] = (...args) => { send({kind:'console', level:lvl.toUpperCase(), message:fmt(args)}); return orig(...args); };
@@ -1452,8 +1739,11 @@ html,body{margin:0;padding:0;background:#181825;color:#cdd6f4;overflow:hidden;us
 .nav{display:flex;align-items:center;gap:6px;height:50px;padding:6px 10px;background:#181825;border-bottom:1px solid #313244;position:relative}
 button.navbtn{background:#313244;border:1px solid #45475a;color:#cdd6f4;border-radius:8px;padding:5px 10px;cursor:pointer;font-size:13px;transition:background .12s ease}
 button.navbtn:hover{background:#45475a}
-#url{flex:1;background:#313244;border:1px solid #45475a;border-radius:18px;padding:6px 14px;color:#cdd6f4;font-size:13px;outline:none}
-#url:focus{border-color:#89b4fa}
+.urlbox{flex:1;display:flex;align-items:center;gap:6px;background:#313244;border:1px solid #45475a;border-radius:18px;padding:0 12px}
+.urlbox:focus-within{border-color:#89b4fa}
+#lock{font-size:12px;color:#a6e3a1;flex-shrink:0}
+#lock.warn{color:#f9e2af}
+#url{flex:1;background:transparent;border:none;padding:6px 0;color:#cdd6f4;font-size:13px;outline:none}
 .hud{font-size:11px;color:#a6e3a1;background:#1e1e2e;border:1px solid #313244;padding:4px 8px;border-radius:6px;white-space:nowrap;cursor:pointer}
 .toast{font-size:11px;color:#f9e2af;background:#313244;padding:4px 8px;border-radius:6px;display:none;white-space:nowrap}
 .star.on{color:#f9e2af;border-color:#f9e2af}
@@ -1464,8 +1754,8 @@ button.navbtn:hover{background:#45475a}
 #suggest{position:fixed;left:150px;right:240px;top:86px;background:#1e1e2e;border:1px solid #45475a;border-radius:0 0 8px 8px;display:none;z-index:99;max-height:164px;overflow-y:auto}
 .sitem{padding:6px 12px;font-size:12px;cursor:pointer;border-bottom:1px solid #313244;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .sitem:hover{background:#313244}
-#findbar{position:fixed;right:12px;top:42px;background:#1e1e2e;border:1px solid #89b4fa;border-radius:8px;padding:4px 8px;display:none;gap:6px;z-index:100}
-#findIn{background:#313244;border:1px solid #45475a;color:#cdd6f4;border-radius:4px;padding:3px 8px;font-size:12px;outline:none}
+#findbar{position:fixed;left:0;right:0;top:86px;height:38px;background:#181825;border-bottom:1px solid #313244;padding:4px 12px;display:none;align-items:center;justify-content:flex-end;gap:6px;z-index:100}
+#findIn{width:240px;background:#313244;border:1px solid #45475a;color:#cdd6f4;border-radius:6px;padding:4px 10px;font-size:12px;outline:none}
 </style></head><body>
 <div class="tabs" id="tabs"></div>
 <div class="nav">
@@ -1473,10 +1763,14 @@ button.navbtn:hover{background:#45475a}
   <button class="navbtn" onclick="send({cmd:'Forward'})" title="Forward (Alt+Right)">&#8594;</button>
   <button id="relBtn" class="navbtn" onclick="send({cmd:'ReloadOrStop'})" title="Reload / Stop (F5)">&#8635;</button>
   <button class="navbtn" onclick="send({cmd:'Home'})" title="Home">&#8962;</button>
-  <input id="url" placeholder="Search or enter URL..." />
+  <div class="urlbox">
+    <span id="lock" title="Connection security">&#9889;</span>
+    <input id="url" placeholder="Search or enter URL..." />
+  </div>
   <span id="toast" class="toast"></span>
   <button id="star" class="navbtn star" onclick="send({cmd:'ToggleBookmark'})" title="Bookmark (Ctrl+D)">&#9734;</button>
-  <span id="hud" class="hud" onclick="send({cmd:'SuspendBackground'})" title="Click to suspend background tabs">0 MB &bull; 1/1 live</span>
+  <button class="navbtn" onclick="send({cmd:'Shortcut',action:'history'})" title="History (Ctrl+H)">&#128339;</button>
+  <span id="hud" class="hud" onclick="send({cmd:'SuspendBackground'})" title="Total Ferrox + WebView2 RAM (click to suspend background tabs)">0 MB &bull; 1/1 live</span>
   <button class="navbtn" onclick="send({cmd:'ToggleDevTools'})" title="DevTools (F12)">F12</button>
 </div>
 <div id="progress"><div id="bar"></div></div>
@@ -1484,7 +1778,7 @@ button.navbtn:hover{background:#45475a}
 <div id="findbar">
   <input id="findIn" placeholder="Find in page..." />
   <button class="navbtn" onclick="send({cmd:'FindInPage',query:document.getElementById('findIn').value})">Next</button>
-  <button class="navbtn" onclick="document.getElementById('findbar').style.display='none'">&times;</button>
+  <button class="navbtn" onclick="window.closeFindBar()">&times;</button>
 </div>
 <script>
 const send = (obj) => window.ipc.postMessage(JSON.stringify(obj));
@@ -1494,6 +1788,7 @@ const sugEl = document.getElementById('suggest');
 const barEl = document.getElementById('bar');
 const relEl = document.getElementById('relBtn');
 const toastEl = document.getElementById('toast');
+const lockEl = document.getElementById('lock');
 let wasLoading = false;
 let finishTimer = null;
 
@@ -1501,8 +1796,12 @@ window.addEventListener('keydown', (e) => {
   const k = e.key.toLowerCase();
   let action = null;
   if(e.key === 'F12' || (e.ctrlKey && e.shiftKey && k === 'i')) action = 'devtools';
+  else if(e.ctrlKey && e.shiftKey && k === 't') action = 'reopen_tab';
   else if(e.ctrlKey && !e.altKey && k === 't') action = 'new_tab';
   else if(e.ctrlKey && !e.altKey && k === 'w') action = 'close_tab';
+  else if(e.ctrlKey && e.key === 'Tab') action = e.shiftKey ? 'prev_tab' : 'next_tab';
+  else if(e.ctrlKey && !e.altKey && k === 'h') action = 'history';
+  else if(e.ctrlKey && e.shiftKey && k === 'b') action = 'bookmarks';
   else if(e.ctrlKey && !e.altKey && k === 'l') action = 'focus_url';
   else if(e.ctrlKey && !e.altKey && k === 'f') action = 'find';
   else if(e.ctrlKey && !e.altKey && k === 'd') action = 'bookmark';
@@ -1523,12 +1822,17 @@ urlEl.addEventListener('input', () => send({cmd:'QuerySuggest', query:urlEl.valu
 urlEl.addEventListener('blur', () => setTimeout(hideSuggest, 140));
 document.getElementById('findIn').addEventListener('keydown', (e) => {
   if(e.key === 'Enter') send({cmd:'FindInPage', query:e.target.value});
-  if(e.key === 'Escape') document.getElementById('findbar').style.display='none';
+  if(e.key === 'Escape') window.closeFindBar();
 });
+window.closeFindBar = () => {
+  document.getElementById('findbar').style.display = 'none';
+  send({cmd:'SetFindOpen', open:false});
+};
 window.toggleFindBar = () => {
   const fb = document.getElementById('findbar');
   const open = fb.style.display !== 'flex';
   fb.style.display = open ? 'flex' : 'none';
+  send({cmd:'SetFindOpen', open});
   if(open) document.getElementById('findIn').focus();
 };
 window.renderSuggestions = (items) => {
@@ -1559,6 +1863,9 @@ window.syncState = (tabs, activeUrl, bookmarked, rssMb, live, total, activeLoadi
   tabsEl.innerHTML = tabs.map(t => `<div class="tab ${t.active?'active':''} ${t.suspended?'suspended':''}" onclick="send({cmd:'SwitchTab',id:'${escHtml(t.id)}'})">${t.loading?'<span class="dot"></span>':''}<span class="title">${t.suspended?'[zZ] ':''}${escHtml(t.title)}</span><button class="x" onclick="event.stopPropagation();send({cmd:'CloseTab',id:'${escHtml(t.id)}'})">&times;</button></div>`).join('')
     + `<button class="newtab" onclick="send({cmd:'NewTab'})" title="New Tab (Ctrl+T)">+</button>`;
   if(document.activeElement !== urlEl) urlEl.value = activeUrl || '';
+  if(String(activeUrl).startsWith('https://')){ lockEl.textContent = '\uD83D\uDD12'; lockEl.classList.remove('warn'); }
+  else if(String(activeUrl).startsWith('http://')){ lockEl.textContent = '\u26A0'; lockEl.classList.add('warn'); }
+  else { lockEl.textContent = '\u26A1'; lockEl.classList.remove('warn'); }
   const star = document.getElementById('star');
   star.textContent = bookmarked ? '\u2605' : '\u2606';
   star.classList.toggle('on', bookmarked);
@@ -1697,14 +2004,18 @@ window.appendConsole = (lvl, msg) => {
   const d = document.createElement('div');
   if(lvl==='ERROR') d.className='err';
   d.textContent = `[${lvl}] ${msg}`;
-  el.appendChild(d); el.scrollTop = el.scrollHeight;
+  el.appendChild(d);
+  while(el.childElementCount > 250) el.removeChild(el.firstElementChild);
+  el.scrollTop = el.scrollHeight;
 };
 window.appendNetwork = (m, u, s) => {
   const el = document.getElementById('netOut');
   const d = document.createElement('div');
   d.className = 'netrow' + (String(s).startsWith('BLOCKED')||String(s).startsWith('ERR') ? ' err' : '');
   d.textContent = `[${s}] ${m} ${u}`;
-  el.appendChild(d); el.scrollTop = el.scrollHeight;
+  el.appendChild(d);
+  while(el.childElementCount > 250) el.removeChild(el.firstElementChild);
+  el.scrollTop = el.scrollHeight;
 };
 window.renderMemory = (uiMb, renMb, renCount, live, total, domJson) => {
   const tot = (uiMb + renMb).toFixed(1);
