@@ -1,0 +1,7 @@
+/target/
+*.WebView2/
+*.log
+*.exe
+*.pdb
+.DS_Store
+Thumbs.db

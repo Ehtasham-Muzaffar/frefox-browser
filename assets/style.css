@@ -1,0 +1,95 @@
+/* Ferrox Browser — Application Stylesheet */
+
+* {
+  font-family: 'Inter', 'Noto Sans', sans-serif;
+}
+
+window {
+  background-color: #1e1e2e;
+  color: #cdd6f4;
+}
+
+.navbar {
+  background-color: #181825;
+  border-bottom: 1px solid #313244;
+  padding: 4px 8px;
+  min-height: 44px;
+}
+
+.url-bar {
+  background-color: #313244;
+  border: 1px solid #45475a;
+  border-radius: 20px;
+  padding: 4px 16px;
+  color: #cdd6f4;
+  font-size: 14px;
+  caret-color: #89b4fa;
+}
+
+.url-bar:focus {
+  border-color: #89b4fa;
+  box-shadow: 0 0 0 2px rgba(137, 180, 250, 0.3);
+}
+
+.tab-strip {
+  background-color: #1e1e2e;
+  border-bottom: 1px solid #313244;
+  padding: 2px 4px;
+  min-height: 36px;
+}
+
+.tab {
+  border-radius: 8px 8px 0 0;
+  padding: 4px 16px;
+  background-color: #313244;
+  color: #bac2de;
+  font-size: 13px;
+}
+
+.tab:hover { background-color: #45475a; }
+.tab.active { background-color: #89b4fa; color: #1e1e2e; }
+.tab.suspended { color: #6c7086; font-style: italic; }
+
+.devtools-panel {
+  background-color: #181825;
+  border-top: 2px solid #89b4fa;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 12px;
+}
+
+.devtools-header {
+  font-weight: bold;
+  color: #89b4fa;
+  padding: 4px 8px;
+  border-bottom: 1px solid #313244;
+}
+
+.console-prompt {
+  color: #a6e3a1;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 14px;
+  font-weight: bold;
+  padding: 0 4px;
+}
+
+.console-run-btn {
+  background-color: #89b4fa;
+  color: #1e1e2e;
+  border-radius: 4px;
+  font-weight: bold;
+  padding: 2px 12px;
+}
+
+.network-list {
+  background-color: #1e1e2e;
+}
+
+.network-list row {
+  padding: 2px 8px;
+  border-bottom: 1px solid #313244;
+  font-family: monospace;
+  font-size: 11px;
+}
+
+.network-error { color: #f38ba8; }
+
